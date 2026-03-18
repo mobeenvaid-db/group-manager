@@ -1,8 +1,11 @@
 """
 Group Manager — Databricks App
 Lets account admins delegate group membership management to designated group managers.
-Uses workspace Account SCIM proxy + user token for group/member operations, and
-Account Access Control API for Group: Manager role assignments (no app DB).
+
+Auth pattern:
+- User identity: from forwarded headers (X-Forwarded-Email, X-Forwarded-User). No OBO for IAM/SCIM.
+- Groups / SCIM / Access Control: all called with the app's service principal (PAT or OAuth).
+- OBO is only used for data/compute features with OBO scopes (e.g. SQL, files); this app does not use OBO for groups.
 """
 
 import os
@@ -25,13 +28,15 @@ DATABRICKS_HOST = os.environ.get("DATABRICKS_HOST", "")
 ACCOUNT_ID = os.environ.get("DATABRICKS_ACCOUNT_ID", "")
 SP_CLIENT_ID = os.environ.get("ACCOUNT_SP_CLIENT_ID", "")
 SP_CLIENT_SECRET = os.environ.get("ACCOUNT_SP_CLIENT_SECRET", "")
+# Optional: use a PAT as the app's service principal instead of OAuth
+SP_PAT = os.environ.get("ACCOUNT_SP_PAT", "").strip() or os.environ.get("DATABRICKS_APP_TOKEN", "").strip()
 
 ACCOUNTS_BASE = f"https://accounts.cloud.databricks.com/api/2.0/accounts/{ACCOUNT_ID}"
 
-# Workspace proxy: Account Groups SCIM (user token) — group managers use this
+# Workspace proxy: Account Groups SCIM (called with SP token)
 WORKSPACE_ACCOUNT_SCIM_BASE = f"{DATABRICKS_HOST}/api/2.0/account/scim/v2" if DATABRICKS_HOST else ""
 
-# Account Access Control (workspace proxy) — assign/revoke Group: Manager
+# Account Access Control (workspace proxy) — assign/revoke Group: Manager (SP token)
 ACCESS_CONTROL_BASE = f"{DATABRICKS_HOST}/api/2.0/preview/accounts/access-control" if DATABRICKS_HOST else ""
 
 # Role identifier for Group: Manager (from assignable roles on a group)
@@ -44,7 +49,7 @@ WORKSPACE_ACCOUNT_SCIM_BASE = f"{DATABRICKS_HOST}/api/2.0/account/scim/v2" if DA
 ACCESS_CONTROL_BASE = f"{DATABRICKS_HOST}/api/2.0/preview/accounts/access-control" if DATABRICKS_HOST else ""
 
 # ---------------------------------------------------------------------------
-# SP Token Cache (optional — used only for admin detection)
+# SP Token (required for groups/SCIM) — PAT or OAuth
 # ---------------------------------------------------------------------------
 
 _sp_token: Optional[str] = None
@@ -52,20 +57,17 @@ _sp_token_expiry: float = 0
 _sp_token_lock = threading.Lock()
 
 
-def _get_user_token(request: Request) -> str:
-    """Return the OBO token from the request. Raises 401 if missing."""
-    token = request.headers.get("X-Forwarded-Access-Token")
-    if not token:
-        raise HTTPException(
-            status_code=401,
-            detail="Not authenticated. Access this app through the Databricks workspace URL.",
-        )
-    return token
+def _sp_configured() -> bool:
+    """True if app has a way to get an SP token (PAT or OAuth)."""
+    return bool(SP_PAT) or (bool(SP_CLIENT_ID) and bool(SP_CLIENT_SECRET))
 
 
 async def get_sp_token() -> Optional[str]:
-    """Get a cached SP token via OAuth2 client-credentials flow. Returns None if SP not configured."""
+    """Get the token used for Groups/SCIM/Access Control. PAT if set, else OAuth client_credentials. Raises 503 if not configured."""
     global _sp_token, _sp_token_expiry
+
+    if SP_PAT:
+        return SP_PAT
 
     if not SP_CLIENT_ID or not SP_CLIENT_SECRET:
         return None
@@ -96,67 +98,54 @@ async def get_sp_token() -> Optional[str]:
     return _sp_token
 
 
-# ---------------------------------------------------------------------------
-# OBO helpers
-# ---------------------------------------------------------------------------
-
-async def get_current_user(request: Request) -> dict:
-    """Identify the calling user from the OBO token injected by Databricks Apps.
-
-    Uses /api/2.0/preview/scim/v2/Me as the primary identity source — this endpoint
-    works reliably with OBO tokens regardless of OAuth scopes.  Falls back to the
-    OIDC userinfo endpoint if the SCIM call fails for any reason.
-    """
-    token = request.headers.get("X-Forwarded-Access-Token")
+async def require_sp_token() -> str:
+    """Return SP token for Groups/SCIM. Raises 503 if SP not configured."""
+    token = await get_sp_token()
     if not token:
         raise HTTPException(
-            status_code=401,
-            detail="Not authenticated. Access this app through the Databricks workspace URL.",
+            status_code=503,
+            detail="Group operations require a service principal. Set ACCOUNT_SP_PAT or ACCOUNT_SP_CLIENT_ID and ACCOUNT_SP_CLIENT_SECRET.",
         )
+    return token
 
-    async with httpx.AsyncClient(timeout=10) as client:
-        # Primary: SCIM /Me — works with any valid workspace token
-        r = await client.get(
-            f"{DATABRICKS_HOST}/api/2.0/preview/scim/v2/Me",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        if r.status_code == 200:
-            data = r.json()
-            email = (data.get("emails") or [{}])[0].get("value") or data.get("userName", "")
-            return {
-                "sub":       data.get("id", ""),
-                "email":     email,
-                "name":      data.get("displayName", email),
-                "user_name": data.get("userName", ""),
-            }
 
-        # Fallback: OIDC userinfo
-        r2 = await client.get(
-            f"{DATABRICKS_HOST}/oidc/v1/userinfo",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        if r2.status_code == 200:
-            return r2.json()
+# ---------------------------------------------------------------------------
+# Identity from forwarded headers (no OBO for IAM/SCIM)
+# ---------------------------------------------------------------------------
 
+def get_current_user_from_headers(request: Request) -> dict:
+    """Identify the calling user from headers set by Databricks when forwarding to the app.
+    Uses X-Forwarded-Email, X-Forwarded-User. Does not call IAM/SCIM with OBO.
+    """
+    email = request.headers.get("X-Forwarded-Email", "").strip()
+    user = request.headers.get("X-Forwarded-User", "").strip()
+    # Prefer email for display and for matching Group: Manager principals (often stored as users/email)
+    if not email and user and "@" in user:
+        email = user
+    if not user and email:
+        user = email
+    if not email and not user:
         raise HTTPException(
             status_code=401,
-            detail=(
-                f"Failed to verify user identity. "
-                f"SCIM /Me returned {r.status_code}, "
-                f"OIDC userinfo returned {r2.status_code}. "
-                f"Host: {DATABRICKS_HOST!r}"
-            ),
+            detail="Not authenticated. Access this app through the Databricks workspace URL (X-Forwarded-Email/X-Forwarded-User required).",
         )
+    return {
+        "email": email or user,
+        "user_name": user or email,
+        "sub": user or email,  # id may be resolved later if needed
+        "name": email or user,
+    }
 
 
 async def check_is_admin(user_email: str) -> bool:
-    """Check whether the user is an account admin via the Account SCIM Users API.
+    """Check whether the user is an account admin via the Account SCIM Users API (SP token).
     Returns False if SP is not configured or user is not an account admin."""
     sp_token = await get_sp_token()
     if not sp_token:
         return False
 
     async with httpx.AsyncClient() as client:
+        # Try by userName (email) and by displayName if needed
         r = await client.get(
             f"{ACCOUNTS_BASE}/scim/v2/Users",
             params={"filter": f'userName eq "{user_email}"'},
@@ -192,18 +181,79 @@ async def general_exception_handler(request: Request, exc: Exception):
 # Debug (temporary — remove after auth is confirmed working)
 # ---------------------------------------------------------------------------
 
+def _redact_headers(headers: dict) -> dict:
+    """Return a copy of headers with sensitive values redacted (for debug only)."""
+    sensitive = {"authorization", "x-forwarded-access-token", "cookie"}
+    return {
+        k: "[REDACTED]" if k.lower() in sensitive else v
+        for k, v in headers.items()
+    }
+
+
 @app.get("/api/debug")
 async def debug(request: Request):
-    """Returns headers and config for auth troubleshooting. Remove in production."""
-    token = request.headers.get("X-Forwarded-Access-Token", "")
+    """Headers and config for troubleshooting. Sensitive headers redacted. Remove in production."""
     return {
-        "databricks_host":          DATABRICKS_HOST,
-        "account_id_set":           bool(ACCOUNT_ID),
-        "sp_client_id_set":         bool(SP_CLIENT_ID),
-        "sp_client_secret_set":     bool(SP_CLIENT_SECRET),
-        "forwarded_token_present":  bool(token),
-        "forwarded_token_prefix":   token[:20] + "..." if token else None,
-        "all_headers":              dict(request.headers),
+        "databricks_host":   DATABRICKS_HOST,
+        "account_id_set":   bool(ACCOUNT_ID),
+        "sp_configured":    _sp_configured(),
+        "sp_client_id_set": bool(SP_CLIENT_ID),
+        "sp_pat_set":       bool(SP_PAT),
+        "x_forwarded_email": request.headers.get("X-Forwarded-Email"),
+        "x_forwarded_user": request.headers.get("X-Forwarded-User"),
+        "all_headers":      _redact_headers(dict(request.headers)),
+        "auth_debug":       "See GET /api/debug/auth for auth-pattern verification.",
+    }
+
+
+@app.get("/api/debug/auth")
+async def debug_auth(request: Request):
+    """
+    Verify auth pattern without calling any APIs:
+    - Identity from forwarded headers (X-Forwarded-Email, X-Forwarded-User).
+    - Groups/SCIM use service principal (PAT or OAuth); OBO not used for IAM/SCIM.
+    - OBO token presence only (for data/compute if you add those features).
+    """
+    obo_raw = request.headers.get("X-Forwarded-Access-Token", "")
+    email = request.headers.get("X-Forwarded-Email", "").strip()
+    user = request.headers.get("X-Forwarded-User", "").strip()
+
+    # Identity this app uses (from headers only)
+    identity_from_headers = {
+        "email":     email or user or None,
+        "user_name": user or email or None,
+        "sub":       user or email or None,
+    }
+    if not identity_from_headers["email"] and not identity_from_headers["user_name"]:
+        identity_from_headers["_note"] = "Missing; set X-Forwarded-Email and/or X-Forwarded-User when forwarding to the app."
+
+    # SP source for groups/SCIM
+    sp_source = "pat" if SP_PAT else ("oauth" if (SP_CLIENT_ID and SP_CLIENT_SECRET) else "none")
+
+    return {
+        "pattern": {
+            "identity_source":       "forwarded_headers",
+            "groups_scim_auth":      "service_principal",
+            "obo_used_for":          "data_compute_only_if_you_add_those_features",
+            "obo_not_used_for":      "iam_scim_groups_access_control",
+        },
+        "forwarded_headers": {
+            "X_Forwarded_Email":           email or None,
+            "X_Forwarded_User":            user or None,
+            "X_Forwarded_Access_Token":    "present" if obo_raw else "absent",
+            "X_Forwarded_Access_Token_len": len(obo_raw) if obo_raw else 0,
+        },
+        "identity_used_by_app": identity_from_headers,
+        "service_principal": {
+            "configured": _sp_configured(),
+            "source":     sp_source,
+            "used_for":  "groups_scim_access_control_user_search",
+        },
+        "checks": {
+            "identity_ok":    bool(email or user),
+            "sp_ok":          _sp_configured(),
+            "ready_for_app":  bool(email or user) and _sp_configured(),
+        },
     }
 
 
@@ -213,12 +263,11 @@ async def debug(request: Request):
 
 @app.get("/api/me")
 async def me(request: Request):
-    user = await get_current_user(request)
-    user_email = user.get("email") or user.get("user_name") or user.get("preferred_username") or user.get("sub", "")
+    user = get_current_user_from_headers(request)
+    user_email = user.get("email") or user.get("user_name") or user.get("sub", "")
     user_id = user.get("sub", "")
     user_name = user.get("name", user_email)
-    is_admin = await check_is_admin(user_email)
-    # Managed groups are determined by Databricks (Group: Manager role). Use GET /api/groups as source of truth.
+    is_admin = await check_is_admin(user_email) if _sp_configured() else False
     return {
         "user_id": user_id,
         "email": user_email,
@@ -234,10 +283,12 @@ async def me(request: Request):
 
 @app.get("/api/groups")
 async def list_groups(request: Request, q: Optional[str] = None, startIndex: int = 1, count: int = 100):
-    await get_current_user(request)
-    token = _get_user_token(request)
+    user = get_current_user_from_headers(request)
+    user_email = user.get("email") or user.get("user_name") or ""
+    token = await require_sp_token()
 
-    params = {"startIndex": startIndex, "count": count}
+    # List all groups with SP (paginate loosely)
+    params = {"startIndex": 1, "count": 500}
     if q:
         params["filter"] = f'displayName co "{q}"'
 
@@ -248,14 +299,57 @@ async def list_groups(request: Request, q: Optional[str] = None, startIndex: int
             headers={"Authorization": f"Bearer {token}"},
         )
         if r.status_code != 200:
-            raise HTTPException(status_code=r.status_code, detail=f"Failed to list groups: {r.text}")
-        return r.json()
+            raise HTTPException(status_code=r.status_code, detail=_err_detail(r, "Failed to list groups"))
+        data = r.json()
+    groups = data.get("Resources") or []
+    total = data.get("totalResults", len(groups))
+
+    is_admin = await check_is_admin(user_email)
+    # Filter to groups this user is allowed to manage (admin or Group: Manager)
+    allowed_ids = set()
+    for g in groups:
+        group_id = g.get("id", "")
+        name = _group_rule_set_name(group_id)
+        try:
+            rs = await _get_rule_set(token, name)
+        except HTTPException as e:
+            if e.status_code == 404:
+                continue
+            raise
+        if is_admin or _user_is_manager_for_group(user_email, rs.get("grant_rules")):
+            allowed_ids.add(group_id)
+
+    filtered = [g for g in groups if g.get("id") in allowed_ids]
+    # Apply client-requested pagination slice
+    start = max(0, startIndex - 1)
+    end = start + count
+    page = filtered[start:end]
+    return {"Resources": page, "totalResults": len(filtered), "startIndex": startIndex, "count": len(page)}
+
+
+async def _user_can_manage_group(token: str, user_email: str, group_id: str) -> bool:
+    """True if user is account admin or Group: Manager for this group."""
+    if await check_is_admin(user_email):
+        return True
+    name = _group_rule_set_name(group_id)
+    try:
+        rs = await _get_rule_set(token, name)
+    except HTTPException as e:
+        if e.status_code == 404:
+            return False
+        raise
+    return _user_is_manager_for_group(user_email, rs.get("grant_rules"))
 
 
 @app.get("/api/groups/{group_id}")
 async def get_group(request: Request, group_id: str):
-    await get_current_user(request)
-    token = _get_user_token(request)
+    user = get_current_user_from_headers(request)
+    user_email = user.get("email") or user.get("user_name") or ""
+    token = await require_sp_token()
+
+    can = await _user_can_manage_group(token, user_email, group_id)
+    if not can:
+        raise HTTPException(status_code=403, detail="You do not have permission to manage this group.")
 
     async with httpx.AsyncClient() as client:
         r = await client.get(
@@ -263,7 +357,7 @@ async def get_group(request: Request, group_id: str):
             headers={"Authorization": f"Bearer {token}"},
         )
         if r.status_code != 200:
-            raise HTTPException(status_code=r.status_code, detail=f"Failed to get group: {r.text}")
+            raise HTTPException(status_code=r.status_code, detail=_err_detail(r, "Failed to get group"))
         return r.json()
 
 
@@ -277,8 +371,13 @@ class AddMemberRequest(BaseModel):
 
 @app.post("/api/groups/{group_id}/members")
 async def add_member(request: Request, group_id: str, body: AddMemberRequest):
-    await get_current_user(request)
-    token = _get_user_token(request)
+    user = get_current_user_from_headers(request)
+    user_email = user.get("email") or user.get("user_name") or ""
+    token = await require_sp_token()
+
+    can = await _user_can_manage_group(token, user_email, group_id)
+    if not can:
+        raise HTTPException(status_code=403, detail="You do not have permission to manage this group.")
 
     payload = {
         "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
@@ -300,8 +399,13 @@ async def add_member(request: Request, group_id: str, body: AddMemberRequest):
 
 @app.delete("/api/groups/{group_id}/members/{member_id}")
 async def remove_member(request: Request, group_id: str, member_id: str):
-    await get_current_user(request)
-    token = _get_user_token(request)
+    user = get_current_user_from_headers(request)
+    user_email = user.get("email") or user.get("user_name") or ""
+    token = await require_sp_token()
+
+    can = await _user_can_manage_group(token, user_email, group_id)
+    if not can:
+        raise HTTPException(status_code=403, detail="You do not have permission to manage this group.")
 
     payload = {
         "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
@@ -385,6 +489,21 @@ def _managers_from_grant_rules(grant_rules: list, group_id: str, group_display_n
     return out
 
 
+def _user_is_manager_for_group(user_email: str, grant_rules: list) -> bool:
+    """True if user_email is a Group: Manager principal in grant_rules (match by email or users/email)."""
+    if not user_email or not grant_rules:
+        return False
+    needle = user_email.lower().strip()
+    for rule in grant_rules or []:
+        if rule.get("role") != GROUP_MANAGER_ROLE:
+            continue
+        for principal in rule.get("principals") or []:
+            pid = principal.split("/", 1)[-1] if "/" in principal else principal
+            if (pid or "").lower().strip() == needle:
+                return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Group Manager Assignments (Account Access Control API)
 # ---------------------------------------------------------------------------
@@ -399,14 +518,13 @@ class AssignManagerRequest(BaseModel):
 
 @app.get("/api/group-managers")
 async def list_group_managers(request: Request):
-    user = await get_current_user(request)
-    user_email = user.get("email") or user.get("preferred_username") or user.get("sub", "")
+    user = get_current_user_from_headers(request)
+    user_email = user.get("email") or user.get("user_name") or user.get("sub", "")
     is_admin = await check_is_admin(user_email)
     if not is_admin:
         raise HTTPException(status_code=403, detail="Only account admins can view all group manager assignments.")
 
-    token = _get_user_token(request)
-    # List groups (user token — admin sees all via workspace proxy)
+    token = await require_sp_token()
     async with httpx.AsyncClient() as client:
         r = await client.get(
             f"{WORKSPACE_ACCOUNT_SCIM_BASE}/Groups",
@@ -440,13 +558,13 @@ async def list_group_managers(request: Request):
 
 @app.post("/api/group-managers")
 async def assign_group_manager(request: Request, body: AssignManagerRequest):
-    user = await get_current_user(request)
-    user_email = user.get("email") or user.get("preferred_username") or user.get("sub", "")
+    user = get_current_user_from_headers(request)
+    user_email = user.get("email") or user.get("user_name") or user.get("sub", "")
     is_admin = await check_is_admin(user_email)
     if not is_admin:
         raise HTTPException(status_code=403, detail="Only account admins can assign group managers.")
 
-    token = _get_user_token(request)
+    token = await require_sp_token()
     name = _group_rule_set_name(body.group_id)
     principal = f"users/{body.manager_id}"
 
@@ -497,13 +615,13 @@ async def revoke_group_manager(request: Request, group_id: str, principal_id: st
 
 
 async def _revoke_group_manager_impl(request: Request, group_id: str, principal_id: str):
-    user = await get_current_user(request)
-    user_email = user.get("email") or user.get("preferred_username") or user.get("sub", "")
+    user = get_current_user_from_headers(request)
+    user_email = user.get("email") or user.get("user_name") or user.get("sub", "")
     is_admin = await check_is_admin(user_email)
     if not is_admin:
         raise HTTPException(status_code=403, detail="Only account admins can revoke group manager assignments.")
 
-    token = _get_user_token(request)
+    token = await require_sp_token()
     name = _group_rule_set_name(group_id)
     principal = f"users/{principal_id}"
 
@@ -533,10 +651,10 @@ async def _revoke_group_manager_impl(request: Request, group_id: str, principal_
 
 @app.get("/api/users/search")
 async def search_users(request: Request, q: str = ""):
-    await get_current_user(request)
-    token = _get_user_token(request)
+    get_current_user_from_headers(request)  # require identity
+    token = await require_sp_token()
 
-    # Workspace SCIM Users (user token) — no SP required
+    # Workspace SCIM Users (SP token)
     params = {"count": 25}
     if q:
         params["filter"] = f'displayName co "{q}" or userName co "{q}"'

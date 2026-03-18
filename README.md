@@ -2,7 +2,7 @@
 
 A lightweight Databricks App that lets account admins **delegate group membership management** to designated group managers — without giving them account admin rights.
 
-Built with React + Tailwind (frontend) and FastAPI (backend). Uses the **workspace Account SCIM proxy** and the **Account Access Control API** so group managers use their own token; no app database and (optionally) no Service Principal required for group-manager flows.
+Built with React + Tailwind (frontend) and FastAPI (backend). Uses the **workspace Account SCIM proxy** and the **Account Access Control API** with the **app’s service principal** (PAT or OAuth); user identity comes from **forwarded headers** (`X-Forwarded-Email`, `X-Forwarded-User`). No OBO for groups/SCIM; no app database.
 
 ---
 
@@ -12,11 +12,14 @@ Managing Databricks account groups has traditionally required account admin acce
 
 ## The Solution
 
-This app uses Databricks’ native **Group: Manager** role. Account admins (or workspace admins) assign the Group: Manager role on a group via the app’s Admin Panel, which calls the **Account Access Control API**. Group managers then use the **workspace Account SCIM proxy** with their own token to list groups they manage and add/remove members — no Account Admin Service Principal or app database required for those operations.
+This app uses Databricks’ native **Group: Manager** role. Account admins assign the Group: Manager role on a group via the app’s Admin Panel (Account Access Control API). Group managers see only groups they are allowed to manage and add/remove members — with **no OBO token** used for groups or SCIM.
 
-- **Group and member operations:** User’s OBO token → `{workspace}/api/2.0/account/scim/v2/` (workspace proxy). Databricks enforces which groups the user can see and modify.
-- **Assign/revoke Group: Manager:** User’s token → Account Access Control API (rule sets on each group). Manager assignments live in Databricks, not in the app.
-- **Admin detection (optional):** If an account-admin Service Principal is configured, the app uses it to detect account admins so the Admin Panel is shown and “list all groups” works for them.
+- **User identity:** From request headers `X-Forwarded-Email` and `X-Forwarded-User` (set by Databricks when forwarding to the app). The app does not call IAM/SCIM with the user’s token.
+- **Group and member operations:** App’s **service principal** (PAT or OAuth) → workspace Account SCIM proxy. The app enforces “group manager” in code: it lists groups and rule sets with the SP, then filters to groups where the current user (from headers) is Group: Manager or account admin.
+- **Assign/revoke Group: Manager:** SP → Account Access Control API (rule sets). Only users the SP identifies as account admins can use the Admin Panel.
+- **User search:** SP → workspace SCIM Users.
+
+**In short:** OBO is only for data/compute features that have OBO scopes (e.g. SQL, files). For groups/SCIM, the app uses the **service principal** and keys off **user identity from forwarded headers**.
 
 ---
 
@@ -26,31 +29,34 @@ This app uses Databricks’ native **Group: Manager** role. Account admins (or w
 User browser
     │
     ▼
-Databricks Apps gateway  ←── injects X-Forwarded-Access-Token (OBO token)
+Databricks Apps gateway  ←── sets X-Forwarded-Email, X-Forwarded-User (and optionally OBO token)
     │
     ▼
 FastAPI backend (main.py)
-    ├── Identifies the user via /api/2.0/preview/scim/v2/Me     (OBO token)
-    ├── Group list/get/members → workspace Account SCIM proxy  (OBO token)
-    ├── Assign/revoke Group: Manager → Access Control API      (OBO token)
-    ├── Admin detection (optional) → Account SCIM Users        (SP token, if configured)
-    └── User search → workspace SCIM Users                     (OBO token)
+    ├── User identity from headers (X-Forwarded-Email, X-Forwarded-User) — no OBO call to IAM/SCIM
+    ├── Group list/get/members → workspace Account SCIM proxy  (SP token)
+    ├── Assign/revoke Group: Manager → Access Control API     (SP token)
+    ├── Admin detection → Account SCIM Users                 (SP token)
+    └── User search → workspace SCIM Users                    (SP token)
 ```
 
-**Authentication (OBO):** The Databricks Apps gateway injects the user’s token as `X-Forwarded-Access-Token`. The backend uses this for all group and member operations and for the Access Control API.
+**Authentication:** The gateway sets `X-Forwarded-Email` and `X-Forwarded-User`; the backend uses these for identity. All Groups, SCIM, and Access Control API calls use the **app’s service principal** (PAT or OAuth). OBO is not used for groups or SCIM.
 
-**Group manager assignments:** Stored in Databricks as the **Group: Manager** role on each group (Account Access Control rule sets). No SQLite or app database.
-
-**Optional Service Principal:** Configure an account-admin SP only if you want the app to detect account admins and show the Admin Panel. Group managers do not need the SP.
+**Group manager enforcement:** The app lists groups and rule sets with the SP, then filters to groups where the current user (from headers) is Group: Manager or account admin. Mutations are gated the same way. Manager assignments live in Databricks (Account Access Control rule sets); no app database.
 
 ---
+
+## Service principal required
+
+This app does **not** use the user's OBO token for Groups or SCIM. It uses the **app's service principal** (PAT or OAuth) for all group, member, and Access Control API calls, and gets **user identity from forwarded headers** (`X-Forwarded-Email`, `X-Forwarded-User`). You do **not** need to add access-management or Groups scopes to the user token. If the SP is not configured, group and user-search endpoints return **503** with a message to set `ACCOUNT_SP_PAT` or `ACCOUNT_SP_CLIENT_ID` / `ACCOUNT_SP_CLIENT_SECRET`.
+
 
 ## Roles
 
 | Role | How it's determined | What they can do |
 |------|---------------------|------------------|
-| **Account Admin** | SP + Account SCIM Users API (if SP configured) | View all groups, assign/revoke Group: Manager, add/remove any member |
-| **Group Manager** | Native Group: Manager role on the group (Databricks) | View and manage members of their assigned groups only (via workspace proxy) |
+| **Account Admin** | SP + Account SCIM Users API | View all groups, assign/revoke Group: Manager, add/remove any member |
+| **Group Manager** | Native Group: Manager role on the group (Databricks) | View and manage members of their assigned groups only (app filters by rule sets) |
 | **Everyone else** | — | Sees only groups they have access to (often empty) |
 
 ---
@@ -67,7 +73,9 @@ Before deploying this app you need:
 
 2. **Node.js** (v18+) to build the React frontend locally before deploying.
 
-3. **(Optional) Account-admin Service Principal** — Only required if you want the app to detect account admins and show the Admin Panel. Group managers can use the app without any SP. If you want the Admin Panel, create an account-admin SP in the [Databricks account console](https://accounts.cloud.databricks.com) under **Service Principals** and add OAuth credentials (client ID + secret).
+3. **Service principal (required)** — The app uses the SP for all Groups, SCIM, and Access Control API calls. Provide either:
+   - **PAT:** a Databricks token with access to the workspace Account SCIM proxy and Account Access Control API (set `ACCOUNT_SP_PAT` or `DATABRICKS_APP_TOKEN` in app env), or
+   - **OAuth:** an account-level service principal with OAuth client ID and secret (set `ACCOUNT_SP_CLIENT_ID` and `ACCOUNT_SP_CLIENT_SECRET` via app resources). Create the SP in the [Databricks account console](https://accounts.cloud.databricks.com) under **Service Principals** and grant it access to the workspace (and Account Access Control if required).
 
 ---
 
@@ -84,15 +92,19 @@ cd ..
 
 This compiles the React app into `frontend/dist/`, which FastAPI serves as static files.
 
-### Step 2 — (Optional) Create the secret scope and add SP credentials
+### Step 2 — Configure the service principal
 
-Only needed if you want the Admin Panel and account-admin detection. The SP credentials are stored as Databricks secrets.
+The app requires a service principal (PAT or OAuth) for group and SCIM operations.
+
+**Option A — PAT:** Set app env `ACCOUNT_SP_PAT` (or `DATABRICKS_APP_TOKEN`) to a token that can call the workspace Account SCIM proxy and Account Access Control API. You can use a workspace or account-level PAT; ensure it has the right permissions.
+
+**Option B — OAuth:** Store the SP credentials in a Databricks secret scope and register them as app resources:
 
 ```bash
 # Create the scope
 databricks secrets create-scope group-manager-secrets
 
-# Add your account-admin SP credentials
+# Add your account-level SP OAuth credentials
 databricks secrets put-secret group-manager-secrets ACCOUNT_SP_CLIENT_ID \
   --string-value "<your-sp-oauth-client-id>"
 
@@ -115,7 +127,7 @@ databricks sync . /Workspace/Users/<your-email>/group-manager --full
 databricks apps create group-manager \
   --description "Delegated group membership management"
 
-# If you configured SP in Step 2, register the secret scope keys as app resources
+# If you use OAuth SP (Option B), register the secret scope keys as app resources
 databricks apps update group-manager --json '{
   "resources": [
     {
@@ -138,7 +150,7 @@ databricks apps update group-manager --json '{
 }'
 ```
 
-> If you skip the SP and secret registration, the app still works for group managers; the Admin Panel will not be shown because the app cannot detect account admins. You can add the SP and resources later and redeploy.
+> Without a configured SP (PAT or OAuth), group list, user search, and Admin Panel endpoints return 503. Ensure `DATABRICKS_HOST` and `DATABRICKS_ACCOUNT_ID` are set (the Apps runtime usually injects these).
 
 ### Step 5 — Deploy the app
 
@@ -230,7 +242,8 @@ group-manager/
 | DELETE | `/api/group-managers/{assignment_id}` | Admin only | Revoke by composite id `group_id:principal_id` |
 | DELETE | `/api/groups/{group_id}/managers/{principal_id}` | Admin only | Revoke Group: Manager for principal on group |
 | GET | `/api/users/search?q=` | Any user | Search workspace users (workspace SCIM) |
-| GET | `/api/debug` | Any user | Auth diagnostics (remove in production) |
+| GET | `/api/debug` | Any user | Auth/config and redacted headers (remove in production) |
+| GET | `/api/debug/auth` | Any user | Auth-pattern verification: forwarded headers, identity, SP status (no API calls) |
 
 ---
 
@@ -275,9 +288,19 @@ After deploying, confirm the following in your workspace:
 
 ---
 
+## Troubleshooting
+
+- **App loads but groups don't load, or I get 503 / 403**  
+  The app uses a **service principal** for Groups/SCIM, not the user token. Ensure [SP is configured](#service-principal-required): set `ACCOUNT_SP_PAT` (or `DATABRICKS_APP_TOKEN`) or `ACCOUNT_SP_CLIENT_ID` / `ACCOUNT_SP_CLIENT_SECRET`. Ensure the Apps gateway forwards **X-Forwarded-Email** and **X-Forwarded-User** so the app can identify the user. If you get 403 on a specific group, the current user may not be an account admin or Group: Manager for that group.
+
+- **User identity / 401**  
+  The app reads identity from **X-Forwarded-Email** and **X-Forwarded-User**. Access the app through the Databricks workspace app URL so the gateway sets these headers.
+
+---
+
 ## Notes
 
 - **No app database:** Group: Manager assignments are stored in Databricks via the Account Access Control API (rule sets per group). Nothing is stored in SQLite or any app database.
-- **SP optional:** If you do not configure the Service Principal, the app works for group managers (they use the workspace Account SCIM proxy with their own token). The Admin Panel and account-admin detection require the SP. When configured, the SP token is cached in memory for 55 minutes.
-- **Workspace proxy:** Group and member operations use `{workspace}/api/2.0/account/scim/v2/` with the user’s token. Databricks returns only groups the user is allowed to see or manage.
-- **Non-admins with no groups:** Users who are not account admins and have no Group: Manager role see an empty dashboard.
+- **Service principal required:** The app uses the SP for all Groups, SCIM, and Access Control API calls. When using OAuth, the SP token is cached in memory and refreshed before expiry.
+- **Workspace proxy:** Group and member operations use `{workspace}/api/2.0/account/scim/v2/` with the **SP token**. The app filters the list to groups the current user (from forwarded headers) is allowed to manage (Group: Manager or account admin).
+- **Empty dashboard:** Users who are not account admins and have no Group: Manager role see an empty dashboard.

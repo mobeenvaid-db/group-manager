@@ -7,11 +7,14 @@ command:
   - "8000"
 
 env:
+  # Injected by Apps runtime when not set: DATABRICKS_HOST (workspace URL)
   - name: DATABRICKS_ACCOUNT_ID
     value: "0d26daa6-5e44-4c97-a497-ef015f91254a"
 
+  # Service principal: use PAT or OAuth. PAT takes precedence if set.
+  # - name: ACCOUNT_SP_PAT
+  #   valueFrom: ACCOUNT_SP_PAT   # optional; or set DATABRICKS_APP_TOKEN
   - name: ACCOUNT_SP_CLIENT_ID
     valueFrom: ACCOUNT_SP_CLIENT_ID
-
   - name: ACCOUNT_SP_CLIENT_SECRET
     valueFrom: ACCOUNT_SP_CLIENT_SECRET
